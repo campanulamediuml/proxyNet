@@ -202,7 +202,7 @@ func (a *App) startTunnel() error {
 	}
 	log.Printf("SSH pool: %s -> %v:%s", localAddr, serverAddrs, remoteAddr)
 
-	pool, err := sshclient.NewPool(localAddr, remoteAddr, poolConfigs)
+	pool, err := sshclient.NewPool(localAddr, remoteAddr, poolConfigs, a.cfg.ConnsPerServer)
 	if err != nil {
 		return fmt.Errorf("pool init: %w", err)
 	}

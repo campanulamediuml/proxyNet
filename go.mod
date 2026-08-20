@@ -4,6 +4,7 @@ go 1.26.4
 
 require (
 	github.com/getlantern/systray v1.2.2
+	github.com/pkg/sftp v1.13.11
 	golang.org/x/crypto v0.55.0
 	golang.org/x/sys v0.47.0
 )
@@ -18,5 +19,4 @@ require (
 	github.com/go-stack/stack v1.8.0 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/oxtoacart/bpool v0.0.0-20190530202638-03653db5a59c // indirect
-	github.com/pkg/sftp v1.13.11 // indirect
 )

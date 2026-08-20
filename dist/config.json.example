@@ -10,6 +10,7 @@
   "tun_gateway": "172.19.0.2",
   "tun_mtu": 1400,
   "dns_server": "127.0.0.1",
+  "conns_per_server": 4,
   "exclude_interfaces": [],
   "local_subnets": [
     "192.168.0.0/16",

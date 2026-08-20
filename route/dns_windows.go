@@ -18,6 +18,7 @@ type DNSManager struct {
 // InterfaceConfig holds the DNS and metric configuration we need to restore.
 type InterfaceConfig struct {
 	InterfaceIndex int        `json:"InterfaceIndex"`
+	InterfaceGuid  string     `json:"InterfaceGuid"`
 	InterfaceAlias string     `json:"InterfaceAlias"`
 	IPv4Servers    stringList `json:"IPv4Servers,omitempty"`
 	IPv6Servers    stringList `json:"IPv6Servers,omitempty"`
@@ -152,7 +153,11 @@ func (d *DNSManager) BackupAndClear() error {
 	return nil
 }
 
-// Restore re-applies the previously saved DNS configuration.
+// Restore re-applies the previously saved DNS configuration. Adapters that
+// currently exist are updated via cmdlet; absent adapters (unplugged USB NIC,
+// VPN adapters whose software is not running, not-yet-initialized at boot)
+// are restored by writing the registry directly, which takes effect as soon
+// as the adapter comes back.
 func (d *DNSManager) Restore() error {
 	data, err := os.ReadFile(d.backupPath)
 	if err != nil {
@@ -167,9 +172,20 @@ func (d *DNSManager) Restore() error {
 		return fmt.Errorf("parse backup: %w", err)
 	}
 
+	// Which adapters currently have DNS client objects.
+	present := map[int]bool{}
+	if current, err := d.listConfig(); err == nil {
+		for _, c := range current {
+			present[c.InterfaceIndex] = true
+		}
+	} else {
+		present = nil // unknown; try cmdlets for everything
+	}
+
 	var sb strings.Builder
 	sb.WriteString("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8\n")
 
+	regRestored := 0
 	for _, iface := range interfaces {
 		idx := iface.InterfaceIndex
 		// Skip the TUN adapter: at disconnect time sing-box has already been
@@ -177,6 +193,24 @@ func (d *DNSManager) Restore() error {
 		if iface.IsTUN || idx <= 0 || idx == 1 || strings.HasPrefix(strings.ToLower(iface.InterfaceAlias), "loopback") {
 			continue
 		}
+
+		if present != nil && !present[idx] {
+			// Adapter absent: restore via registry, effective on its return.
+			if iface.InterfaceGuid == "" {
+				continue
+			}
+			if len(iface.IPv4Servers) > 0 {
+				fmt.Fprintf(&sb, "try { Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\%s' -Name 'NameServer' -Value '%s' -ErrorAction Stop } catch {}\n",
+					iface.InterfaceGuid, strings.Join(iface.IPv4Servers, ","))
+			}
+			if len(iface.IPv6Servers) > 0 {
+				fmt.Fprintf(&sb, "try { Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters\\Interfaces\\%s' -Name 'NameServer' -Value '%s' -ErrorAction Stop } catch {}\n",
+					iface.InterfaceGuid, strings.Join(iface.IPv6Servers, ","))
+			}
+			regRestored++
+			continue
+		}
+
 		if len(iface.IPv4Servers) > 0 {
 			fmt.Fprintf(&sb, "try { Set-DnsClientServerAddress -InterfaceIndex %d -ServerAddresses %s -ErrorAction Stop } catch { Write-Output \"restore dns ifindex=%d: $($_.Exception.Message)\" }\n",
 				idx, psStringArray(iface.IPv4Servers), idx)
@@ -198,6 +232,9 @@ func (d *DNSManager) Restore() error {
 		fmt.Fprintf(os.Stderr, "restore config: %v: %s\n", err, strings.TrimSpace(out))
 	} else if trimmed := strings.TrimSpace(out); trimmed != "" {
 		fmt.Fprintln(os.Stderr, trimmed)
+	}
+	if regRestored > 0 {
+		fmt.Fprintf(os.Stderr, "restored %d absent adapter(s) via registry\n", regRestored)
 	}
 
 	// The backup file is kept permanently: the company network uses static
@@ -229,6 +266,7 @@ func (d *DNSManager) listConfig() ([]InterfaceConfig, error) {
 $v4 = Get-DnsClientServerAddress -AddressFamily IPv4 | Select-Object InterfaceIndex, InterfaceAlias, ServerAddresses
 $v6 = Get-DnsClientServerAddress -AddressFamily IPv6 | Select-Object InterfaceIndex, InterfaceAlias, ServerAddresses
 $metrics = Get-NetIPInterface | Select-Object InterfaceIndex, InterfaceAlias, AddressFamily, InterfaceMetric
+$adapters = Get-NetAdapter | Select-Object InterfaceIndex, InterfaceGuid
 $v4Dict = @{}
 $v6Dict = @{}
 foreach ($i in $v4) { if ($i.ServerAddresses) { $v4Dict[[int]$i.InterfaceIndex] = @($i.ServerAddresses) } }
@@ -239,11 +277,13 @@ $result = foreach ($idxRaw in $allIndexes) {
     $alias = ($metrics | Where-Object { $_.InterfaceIndex -eq $idx } | Select-Object -First 1).InterfaceAlias
     if (-not $alias) { $alias = ($v4 | Where-Object { $_.InterfaceIndex -eq $idx } | Select-Object -First 1).InterfaceAlias }
     if (-not $alias) { $alias = ($v6 | Where-Object { $_.InterfaceIndex -eq $idx } | Select-Object -First 1).InterfaceAlias }
+    $guid = ($adapters | Where-Object { $_.InterfaceIndex -eq $idx } | Select-Object -First 1).InterfaceGuid
     $isTun = ($alias -eq 'tun0')
     $m4 = $metrics | Where-Object { $_.InterfaceIndex -eq $idx -and $_.AddressFamily -eq 'IPv4' } | Select-Object -First 1
     $m6 = $metrics | Where-Object { $_.InterfaceIndex -eq $idx -and $_.AddressFamily -eq 'IPv6' } | Select-Object -First 1
     [PSCustomObject]@{
         InterfaceIndex = $idx
+        InterfaceGuid = "$guid"
         InterfaceAlias = $alias
         IPv4Servers = if ($v4Dict.ContainsKey($idx)) { $v4Dict[$idx] } else { @() }
         IPv6Servers = if ($v6Dict.ContainsKey($idx)) { $v6Dict[$idx] } else { @() }

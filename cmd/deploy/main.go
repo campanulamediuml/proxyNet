@@ -1,215 +1,264 @@
-// deploy is a one-click tool that (re)installs the proxyNet server-side
-// environment on the Linux box over SSH: sing-box binary, server config,
-// a systemd unit with auto-restart, and the dnsmasq DNS forwarder.
-// It is idempotent — safe to run again after messing up the server.
+// deploy reads the servers list from config.json and deploys the proxyNet
+// server-side environment (sing-box + dnsmasq + systemd units) to every
+// server over SSH/SFTP. It uploads the local server-kit files first so the
+// remote side needs no internet access at all.
 package main
 
 import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
 
+type serverEntry struct {
+	Server         string `json:"server"`
+	Port           int    `json:"port,omitempty"`
+	User           string `json:"user,omitempty"`
+	Password       string `json:"password,omitempty"`
+	PrivateKeyPath string `json:"private_key_path,omitempty"`
+}
+
 type config struct {
-	Server   string `json:"server"`
-	Port     int    `json:"port"`
-	User     string `json:"user"`
-	Password string `json:"password"`
+	Server         string        `json:"server"`
+	Port           int           `json:"port"`
+	User           string        `json:"user"`
+	Password       string        `json:"password"`
+	PrivateKeyPath string        `json:"private_key_path"`
+	Servers        []serverEntry `json:"servers,omitempty"`
 }
 
-const remoteScript = `set -e
-VERSION="1.13.19"
-
-echo "=== [1/5] sing-box binary ==="
-if ! command -v sing-box >/dev/null 2>&1; then
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64) ARCH=amd64 ;;
-        aarch64|arm64) ARCH=arm64 ;;
-        *) echo "unsupported arch: $ARCH"; exit 1 ;;
-    esac
-    F="sing-box-${VERSION}-linux-${ARCH}.tar.gz"
-    cd /tmp
-    ok=0
-    for u in \
-        "https://ghproxy.net/https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/${F}" \
-        "https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/${F}" \
-        "https://mirror.ghproxy.com/https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/${F}" \
-        "https://ghproxy.com/https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/${F}"; do
-        echo "trying $u"
-        if curl -fL -k --max-time 300 -o "$F" "$u"; then ok=1; break; fi
-    done
-    [ "$ok" = "1" ] || { echo "download sing-box failed"; exit 1; }
-    tar xzf "$F"
-    install -m 0755 "sing-box-${VERSION}-linux-${ARCH}/sing-box" /usr/local/bin/sing-box
-    rm -rf "$F" "sing-box-${VERSION}-linux-${ARCH}"
-fi
-sing-box version | head -1
-
-echo "=== [2/5] server config ==="
-cat > /etc/sing-box-server.json <<'EOF'
-{
-  "log": {
-    "level": "info"
-  },
-  "inbounds": [
-    {
-      "type": "socks",
-      "tag": "socks-in",
-      "listen": "127.0.0.1",
-      "listen_port": 10010
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ]
-}
-EOF
-echo written
-
-echo "=== [3/5] systemd unit ==="
-cat > /etc/systemd/system/sing-box.service <<'EOF'
-[Unit]
-Description=sing-box SOCKS5 server (proxyNet)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box-server.json
-Restart=always
-RestartSec=3
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-pkill -f "sing-box run" 2>/dev/null || true
-systemctl daemon-reload
-systemctl enable sing-box
-systemctl restart sing-box
-echo "sing-box service: $(systemctl is-active sing-box)"
-
-echo "=== [4/5] dnsmasq DNS forwarder ==="
-
-setup_apt_mirror() {
-    if grep -q "mirrors.aliyun.com" /etc/apt/sources.list 2>/dev/null; then
-        return
-    fi
-    CODENAME="jammy"
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        CODENAME="${VERSION_CODENAME:-jammy}"
-    fi
-    cp /etc/apt/sources.list "/etc/apt/sources.list.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
-    cat > /etc/apt/sources.list <<EOF
-deb http://mirrors.aliyun.com/ubuntu/ ${CODENAME} main restricted universe multiverse
-deb http://mirrors.aliyun.com/ubuntu/ ${CODENAME}-updates main restricted universe multiverse
-deb http://mirrors.aliyun.com/ubuntu/ ${CODENAME}-backports main restricted universe multiverse
-deb http://mirrors.aliyun.com/ubuntu/ ${CODENAME}-security main restricted universe multiverse
-EOF
-    echo "apt mirror switched to mirrors.aliyun.com (${CODENAME})"
+func (c *config) serverList() []serverEntry {
+	if len(c.Servers) == 0 {
+		return []serverEntry{{
+			Server:         c.Server,
+			Port:           c.Port,
+			User:           c.User,
+			Password:       c.Password,
+			PrivateKeyPath: c.PrivateKeyPath,
+		}}
+	}
+	out := make([]serverEntry, len(c.Servers))
+	for i, s := range c.Servers {
+		if s.Port == 0 {
+			s.Port = c.Port
+		}
+		if s.User == "" {
+			s.User = c.User
+		}
+		if s.Password == "" {
+			s.Password = c.Password
+		}
+		if s.PrivateKeyPath == "" {
+			s.PrivateKeyPath = c.PrivateKeyPath
+		}
+		out[i] = s
+	}
+	return out
 }
 
-if ! command -v dnsmasq >/dev/null 2>&1; then
-    if ls /root/debs/*.deb >/dev/null 2>&1; then
-        echo "offline install dnsmasq from /root/debs"
-        dpkg -i /root/debs/dns-root-data_*.deb \
-                /root/debs/dnsmasq-base_*.deb \
-                /root/debs/dnsmasq_*.deb || true
-    fi
-fi
-if ! command -v dnsmasq >/dev/null 2>&1; then
-    setup_apt_mirror
-    apt-get update -qq || true
-    apt-get install -y -qq dnsmasq || echo "WARN: dnsmasq install failed"
-fi
-if command -v dnsmasq >/dev/null 2>&1; then
-    cat > /etc/dnsmasq.d/proxynet.conf <<'EOF'
-# proxyNet DNS forwarder: TCP/UDP on 127.0.0.1:53, forward to company DNS
-listen-address=127.0.0.1
-bind-interfaces
-no-dhcp-interface=lo
-no-resolv
-server=192.168.3.250
-EOF
-    systemctl enable dnsmasq 2>/dev/null || true
-    systemctl restart dnsmasq || echo "WARN: dnsmasq restart failed"
-    echo "dnsmasq service: $(systemctl is-active dnsmasq)"
-fi
-
-echo "=== [5/5] verify ==="
-sleep 1
-ss -tlnp | grep -E ":(53|10010)\s" || echo "WARN: nothing listening on 53/10010"
-echo "=== done ==="
-`
+type result struct {
+	server string
+	err    error
+}
 
 func main() {
-	cfgPath := flag.String("config", "", "path to config.json (default: ./config.json or ./dist/config.json)")
-	server := flag.String("server", "", "override server address")
-	port := flag.Int("port", 0, "override ssh port")
-	user := flag.String("user", "", "override ssh user")
-	password := flag.String("password", "", "override ssh password")
+	cfgPath := flag.String("config", "", "path to config.json")
+	kitPath := flag.String("kit", "", "path to server-kit directory")
 	flag.Parse()
 
 	cfg := loadConfig(*cfgPath)
-	if *server != "" {
-		cfg.Server = *server
-	}
-	if *port != 0 {
-		cfg.Port = *port
-	}
-	if *user != "" {
-		cfg.User = *user
-	}
-	if *password != "" {
-		cfg.Password = *password
-	}
-	if cfg.Server == "" || cfg.User == "" || cfg.Password == "" {
-		fmt.Fprintln(os.Stderr, "server/user/password required (put them in config.json)")
+	servers := cfg.serverList()
+	if len(servers) == 0 {
+		fmt.Fprintln(os.Stderr, "no servers in config")
 		os.Exit(1)
 	}
 
-	addr := fmt.Sprintf("%s:%d", cfg.Server, cfg.Port)
-	fmt.Printf("Deploying to %s as %s ...\n", addr, cfg.User)
+	kit := findKit(*kitPath)
+	fmt.Printf("server-kit: %s\n", kit)
+	fmt.Printf("deploying to %d server(s)...\n\n", len(servers))
 
-	client, err := ssh.Dial("tcp", addr, &ssh.ClientConfig{
-		User:            cfg.User,
-		Auth:            []ssh.AuthMethod{ssh.Password(cfg.Password)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         15 * time.Second,
-	})
+	results := make(chan result, len(servers))
+	var wg sync.WaitGroup
+	for _, s := range servers {
+		s := s
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- result{server: s.Server, err: deployOne(s, kit)}
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	fmt.Println("\n===== summary =====")
+	failed := 0
+	for r := range results {
+		if r.err != nil {
+			failed++
+			fmt.Printf("[FAIL] %s: %v\n", r.server, r.err)
+		} else {
+			fmt.Printf("[ OK ] %s\n", r.server)
+		}
+	}
+	if failed > 0 {
+		os.Exit(1)
+	}
+}
+
+// deployOne uploads the server-kit and runs deploy-server.sh on one server.
+func deployOne(s serverEntry, kit string) error {
+	prefix := fmt.Sprintf("[%s] ", s.Server)
+	logf := func(format string, args ...interface{}) {
+		fmt.Printf(prefix+format+"\n", args...)
+	}
+
+	sshCfg, err := buildSSHConfig(s)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ssh dial failed: %v\n", err)
-		os.Exit(1)
+		return err
+	}
+
+	addr := fmt.Sprintf("%s:%d", s.Server, s.Port)
+	logf("connecting ...")
+	client, err := ssh.Dial("tcp", addr, sshCfg)
+	if err != nil {
+		return fmt.Errorf("ssh dial: %w", err)
 	}
 	defer client.Close()
 
+	// Upload server-kit via SFTP (best effort; missing local files are skipped
+	// and the remote script falls back to downloading).
+	ft, err := sftp.NewClient(client)
+	if err != nil {
+		return fmt.Errorf("sftp: %w", err)
+	}
+	defer ft.Close()
+
+	remoteDir := "/root/server-kit"
+	_ = ft.MkdirAll(remoteDir + "/debs")
+
+	uploads := map[string]string{
+		filepath.Join(kit, "deploy-server.sh"): remoteDir + "/deploy-server.sh",
+	}
+	// sing-box tarball and debs are optional but enable fully offline deploys.
+	if entries, err := os.ReadDir(kit); err == nil {
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "sing-box-") && strings.HasSuffix(e.Name(), ".tar.gz") {
+				uploads[filepath.Join(kit, e.Name())] = remoteDir + "/" + e.Name()
+			}
+		}
+	}
+	if entries, err := os.ReadDir(filepath.Join(kit, "debs")); err == nil {
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), ".deb") {
+				uploads[filepath.Join(kit, "debs", e.Name())] = remoteDir + "/debs/" + e.Name()
+			}
+		}
+	}
+
+	for local, remote := range uploads {
+		if _, err := os.Stat(local); err != nil {
+			continue
+		}
+		if err := uploadFile(ft, local, remote); err != nil {
+			return fmt.Errorf("upload %s: %w", filepath.Base(local), err)
+		}
+		logf("uploaded %s", filepath.Base(local))
+	}
+	_ = ft.Chmod(remoteDir+"/deploy-server.sh", 0755)
+
+	// Run the deploy script, streaming its output.
 	session, err := client.NewSession()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "new session failed: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("new session: %w", err)
 	}
 	defer session.Close()
 
-	session.Stdin = strings.NewReader(remoteScript)
-	session.Stdout = os.Stdout
-	session.Stderr = os.Stderr
+	session.Stdout = &prefixWriter{prefix: prefix, w: os.Stdout}
+	session.Stderr = &prefixWriter{prefix: prefix, w: os.Stderr}
 
-	if err := session.Run("bash -s"); err != nil {
-		fmt.Fprintf(os.Stderr, "\ndeploy failed: %v\n", err)
-		os.Exit(1)
+	logf("running deploy-server.sh ...")
+	if err := session.Run("bash " + remoteDir + "/deploy-server.sh"); err != nil {
+		return fmt.Errorf("deploy script: %w", err)
 	}
-	fmt.Println("\nDeploy finished.")
+	logf("done")
+	return nil
+}
+
+func uploadFile(ft *sftp.Client, localPath, remotePath string) error {
+	src, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	dst, err := ft.Create(remotePath)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
+	_, err = io.Copy(dst, src)
+	return err
+}
+
+func buildSSHConfig(s serverEntry) (*ssh.ClientConfig, error) {
+	var auth []ssh.AuthMethod
+	if s.PrivateKeyPath != "" {
+		key, err := os.ReadFile(s.PrivateKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("read private key: %w", err)
+		}
+		signer, err := ssh.ParsePrivateKey(key)
+		if err != nil {
+			return nil, fmt.Errorf("parse private key: %w", err)
+		}
+		auth = append(auth, ssh.PublicKeys(signer))
+	}
+	if s.Password != "" {
+		auth = append(auth, ssh.Password(s.Password))
+	}
+	if len(auth) == 0 {
+		return nil, fmt.Errorf("no authentication method for %s", s.Server)
+	}
+	return &ssh.ClientConfig{
+		User:            s.User,
+		Auth:            auth,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         15 * time.Second,
+	}, nil
+}
+
+// prefixWriter prefixes every line with the server tag so parallel output
+// stays readable.
+type prefixWriter struct {
+	prefix string
+	w      io.Writer
+	buf    string
+}
+
+func (p *prefixWriter) Write(b []byte) (int, error) {
+	p.buf += string(b)
+	for {
+		i := strings.IndexByte(p.buf, '\n')
+		if i < 0 {
+			break
+		}
+		line := p.buf[:i]
+		p.buf = p.buf[i+1:]
+		if strings.TrimSpace(line) != "" {
+			fmt.Fprintf(p.w, "%s%s\n", p.prefix, line)
+		}
+	}
+	return len(b), nil
 }
 
 func loadConfig(path string) *config {
@@ -218,14 +267,12 @@ func loadConfig(path string) *config {
 	candidates := []string{path}
 	if path == "" {
 		exe, _ := os.Executable()
-		exeDir := filepath.Dir(exe)
 		candidates = []string{
 			"config.json",
 			filepath.Join("dist", "config.json"),
-			filepath.Join(exeDir, "config.json"),
+			filepath.Join(filepath.Dir(exe), "config.json"),
 		}
 	}
-
 	for _, c := range candidates {
 		if c == "" {
 			continue
@@ -235,9 +282,33 @@ func loadConfig(path string) *config {
 			continue
 		}
 		if err := json.Unmarshal(data, cfg); err == nil {
-			fmt.Printf("Using config: %s\n", c)
+			fmt.Printf("using config: %s\n", c)
 			return cfg
 		}
 	}
 	return cfg
+}
+
+func findKit(flagValue string) string {
+	exe, _ := os.Executable()
+	candidates := []string{flagValue}
+	if flagValue == "" {
+		candidates = []string{
+			"server-kit",
+			filepath.Join("dist", "server-kit"),
+			filepath.Join(filepath.Dir(exe), "server-kit"),
+		}
+	}
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		if st, err := os.Stat(c); err == nil && st.IsDir() {
+			abs, _ := filepath.Abs(c)
+			return abs
+		}
+	}
+	fmt.Fprintln(os.Stderr, "server-kit directory not found (deploy-server.sh + tarball + debs)")
+	os.Exit(1)
+	return ""
 }

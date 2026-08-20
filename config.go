@@ -26,6 +26,7 @@ type Config struct {
 	TUNGateway        string        `json:"tun_gateway"`
 	TUNMTU            int           `json:"tun_mtu"`
 	DNSServer         string        `json:"dns_server"`
+	ConnsPerServer    int           `json:"conns_per_server"`
 	ExcludeInterfaces []string      `json:"exclude_interfaces"`
 	LocalSubnets      []string      `json:"local_subnets"`
 	Servers           []ServerEntry `json:"servers,omitempty"`
@@ -81,8 +82,9 @@ func DefaultConfig() *Config {
 		TUNInterface: "tun0",
 		TUNAddress:   "172.19.0.1/30",
 		TUNGateway:   "172.19.0.2",
-		TUNMTU:       1400,
-		DNSServer:         "127.0.0.1",
+		TUNMTU:          1400,
+		DNSServer:       "127.0.0.1",
+		ConnsPerServer:  4,
 		ExcludeInterfaces: []string{},
 		LocalSubnets: []string{
 			"192.168.0.0/16",
