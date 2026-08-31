@@ -1,0 +1,61 @@
+{
+  "log": {
+    "level": "info",
+    "output": "sing-box.log"
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "remote",
+        "type": "tcp",
+        "server": "127.0.0.1",
+        "server_port": 53,
+        "detour": "proxy"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "tun0",
+      "address": ["172.19.0.1/30"],
+      "mtu": 1400,
+      "auto_route": true,
+      "strict_route": false,
+      "stack": "system",
+      "endpoint_independent_nat": true,
+      "route_exclude_address": ["192.168.0.0/16","10.0.0.0/8","172.16.0.0/12","127.0.0.0/8","192.168.3.33/32"],
+      "exclude_interface": []
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "socks",
+      "tag": "proxy",
+      "server": "127.0.0.1",
+      "server_port": 10010
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "port": 53,
+        "action": "hijack-dns"
+      }
+    ],
+    "final": "proxy"
+  }
+}
