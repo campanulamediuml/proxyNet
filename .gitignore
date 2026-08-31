@@ -1,0 +1,5 @@
+*.exe
+dist/
+config.json
+*.log
+.idea/
