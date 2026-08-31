@@ -1,6 +1,6 @@
 {
-  "server": "serverip",
-  "port": 22,
+  "server": "192.168.3.33",
+  "port": 10022,
   "user": "root",
   "password": "your_password_here",
   "private_key_path": "",
@@ -16,5 +16,10 @@
     "10.0.0.0/8",
     "172.16.0.0/12",
     "127.0.0.0/8"
+  ],
+  "servers": [
+    { "server": "192.168.3.33" },
+    { "server": "192.168.3.100" },
+    { "server": "192.168.3.101", "port": 22, "user": "root", "password": "这台密码不一样就单独写" }
   ]
 }

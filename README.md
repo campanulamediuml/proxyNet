@@ -102,6 +102,7 @@ nohup sing-box run -c /etc/sing-box-server.json > /var/log/sing-box.log 2>&1 &
 - 必须以管理员运行（TUN 网卡和路由表修改需要）。
 - 第一次运行时如果没有 `config.json`，程序会生成 `config.json.example`，你改好密码后重命名为 `config.json`。
 - `dns_server` 默认指向 3.33 上的 `dnsmasq` 转发器（`127.0.0.1:53`），DNS 查询会加密在 SSH 隧道里，**不会泄漏到公司 DNS**。
+- `servers` 数组可填多台工控机（缺省字段继承顶层 `port/user/password`）。填多台时每个新连接随机挑一台走，某台挂了自动跳过并重连；填一台或不填则退化为原来的单服务器模式。
 - `local_subnets` 里的网段会走物理网卡直连（公司内网、WSL/Hyper-V 内部网段等），公网流量（包括 WSL）默认也走隧道。如果 WSL 出现异常，可把对应接口名加入 `exclude_interfaces` 排查。
 - 如果程序崩溃或被强杀导致断网：再次启动程序会自动恢复 DNS；或双击 `dist\恢复网络.bat`（等同 `proxyNet.exe -restore`）。`dns_backup.json` 会常驻，启动时按备份恢复仍在的网卡。
 - 审计侧看不到具体域名，但能看到你的机器和 3.33 之间有大量持续 SSH 流量。

@@ -22,7 +22,7 @@ import (
 // App orchestrates the SSH tunnel, sing-box client and tray UI.
 type App struct {
 	cfg        *Config
-	ssh        *sshclient.Client
+	pool       *sshclient.Pool
 	sb         *singbox.Manager
 	dnsManager *route.DNSManager
 	systray    *tray.Tray
@@ -103,16 +103,11 @@ func main() {
 		time.Sleep(5 * time.Second)
 		os.Exit(1)
 	}
-	log.Printf("Config loaded: server=%s:%d user=%s", cfg.Server, cfg.Port, cfg.User)
-
-	if cfg.Password == "" && cfg.PrivateKeyPath == "" {
-		log.Println("No authentication method configured")
-		fmt.Fprintln(os.Stderr, "No authentication method configured.")
-		writeExampleConfig(exeDir)
-		fmt.Println("A config.json.example has been created. Please edit it and rename to config.json.")
-		time.Sleep(5 * time.Second)
-		os.Exit(1)
+	serverAddrs := make([]string, 0, len(cfg.ServerList()))
+	for _, s := range cfg.ServerList() {
+		serverAddrs = append(serverAddrs, fmt.Sprintf("%s:%d", s.Server, s.Port))
 	}
+	log.Printf("Config loaded: %d server(s): %s", len(serverAddrs), strings.Join(serverAddrs, ", "))
 
 	sbExe := singbox.FindExecutable(exeDir)
 	if sbExe == "" {
@@ -185,51 +180,55 @@ func (a *App) connect() {
 	log.Println("Connected")
 }
 
-// startTunnel establishes the SSH tunnel and starts sing-box, waiting until
-// the TUN interface is actually up. Caller must hold a.mu. On failure it
-// cleans up whatever it started.
+// startTunnel establishes the SSH connection pool and starts sing-box,
+// waiting until the TUN interface is actually up. Caller must hold a.mu.
+// On failure it cleans up whatever it started.
 func (a *App) startTunnel() error {
 	localAddr := fmt.Sprintf("127.0.0.1:%d", a.cfg.ListenPort)
 	remoteAddr := fmt.Sprintf("127.0.0.1:%d", a.cfg.ListenPort)
-	log.Printf("SSH tunnel: %s -> %s:%s", localAddr, a.cfg.Server, remoteAddr)
 
-	sshClient, err := sshclient.New(
-		a.cfg.Server,
-		a.cfg.Port,
-		a.cfg.User,
-		a.cfg.Password,
-		a.cfg.PrivateKeyPath,
-		localAddr,
-		remoteAddr,
-	)
+	servers := a.cfg.ServerList()
+	serverAddrs := make([]string, len(servers))
+	poolConfigs := make([]sshclient.ServerConfig, len(servers))
+	for i, s := range servers {
+		serverAddrs[i] = s.Server
+		poolConfigs[i] = sshclient.ServerConfig{
+			Server:   s.Server,
+			Port:     s.Port,
+			User:     s.User,
+			Password: s.Password,
+			KeyPath:  s.PrivateKeyPath,
+		}
+	}
+	log.Printf("SSH pool: %s -> %v:%s", localAddr, serverAddrs, remoteAddr)
+
+	pool, err := sshclient.NewPool(localAddr, remoteAddr, poolConfigs)
 	if err != nil {
-		return fmt.Errorf("ssh init: %w", err)
+		return fmt.Errorf("pool init: %w", err)
 	}
-
-	if err := sshClient.Start(); err != nil {
-		return fmt.Errorf("ssh connect: %w", err)
+	if err := pool.Start(); err != nil {
+		return fmt.Errorf("pool start: %w", err)
 	}
-	log.Println("SSH tunnel established")
-	a.ssh = sshClient
+	a.pool = pool
 
 	if err := a.sb.WriteConfig(
 		a.cfg.TUNInterface,
 		a.cfg.TUNAddress,
 		a.cfg.TUNMTU,
 		a.cfg.ListenPort,
-		a.cfg.Server,
+		serverAddrs,
 		a.cfg.DNSServer,
 		a.cfg.ExcludeInterfaces,
 		a.cfg.LocalSubnets,
 	); err != nil {
-		a.ssh.Stop()
-		a.ssh = nil
+		a.pool.Stop()
+		a.pool = nil
 		return fmt.Errorf("write sing-box config: %w", err)
 	}
 
 	if err := a.sb.Start(); err != nil {
-		a.ssh.Stop()
-		a.ssh = nil
+		a.pool.Stop()
+		a.pool = nil
 		return fmt.Errorf("start sing-box: %w", err)
 	}
 	log.Println("sing-box client started")
@@ -238,8 +237,8 @@ func (a *App) startTunnel() error {
 	for i := 0; i < 12; i++ {
 		if err := a.sb.Err(); err != nil {
 			_ = a.sb.Stop()
-			a.ssh.Stop()
-			a.ssh = nil
+			a.pool.Stop()
+			a.pool = nil
 			return fmt.Errorf("sing-box failed: %w", err)
 		}
 		if tunInterfaceExists(a.cfg.TUNInterface) {
@@ -249,8 +248,8 @@ func (a *App) startTunnel() error {
 	}
 
 	_ = a.sb.Stop()
-	a.ssh.Stop()
-	a.ssh = nil
+	a.pool.Stop()
+	a.pool = nil
 	return fmt.Errorf("tun interface %s did not come up", a.cfg.TUNInterface)
 }
 
@@ -275,7 +274,7 @@ func (a *App) watchdog(stop chan struct{}) {
 			return
 		}
 
-		sshDead := a.ssh == nil || !a.ssh.Alive(8*time.Second)
+		sshDead := a.pool == nil || a.pool.AliveCount() == 0
 		sbDead := a.sb.Err() != nil
 		if !sshDead && !sbDead {
 			failures = 0
@@ -286,9 +285,9 @@ func (a *App) watchdog(stop chan struct{}) {
 		log.Printf("watchdog: tunnel down (sshDead=%v sbDead=%v), reconnecting", sshDead, sbDead)
 		a.systray.SetStatus("reconnecting...")
 		_ = a.sb.Stop()
-		if a.ssh != nil {
-			a.ssh.Stop()
-			a.ssh = nil
+		if a.pool != nil {
+			a.pool.Stop()
+			a.pool = nil
 		}
 		a.mu.Unlock()
 
@@ -338,9 +337,9 @@ func (a *App) disconnect() {
 	}
 
 	_ = a.sb.Stop()
-	if a.ssh != nil {
-		a.ssh.Stop()
-		a.ssh = nil
+	if a.pool != nil {
+		a.pool.Stop()
+		a.pool = nil
 	}
 
 	if a.dnsApplied {
@@ -379,6 +378,11 @@ func getExeDir() (string, error) {
 func writeExampleConfig(dir string) {
 	cfg := DefaultConfig()
 	cfg.Password = "your_password_here"
+	cfg.Servers = []ServerEntry{
+		{Server: "192.168.3.33"},
+		{Server: "192.168.3.100"},
+		{Server: "192.168.3.101", Port: 22, User: "root", Password: "这台密码不一样就单独写"},
+	}
 	data, _ := json.MarshalIndent(cfg, "", "  ")
 	_ = os.WriteFile(filepath.Join(dir, "config.json.example"), data, 0644)
 }

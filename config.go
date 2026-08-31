@@ -15,19 +15,61 @@ var (
 )
 
 type Config struct {
-	Server            string   `json:"server"`
-	Port              int      `json:"port"`
-	User              string   `json:"user"`
-	Password          string   `json:"password"`
-	PrivateKeyPath    string   `json:"private_key_path"`
-	ListenPort        int      `json:"listen_port"`
-	TUNInterface      string   `json:"tun_interface"`
-	TUNAddress        string   `json:"tun_address"`
-	TUNGateway        string   `json:"tun_gateway"`
-	TUNMTU            int      `json:"tun_mtu"`
-	DNSServer         string   `json:"dns_server"`
-	ExcludeInterfaces []string `json:"exclude_interfaces"`
-	LocalSubnets      []string `json:"local_subnets"`
+	Server            string        `json:"server"`
+	Port              int           `json:"port"`
+	User              string        `json:"user"`
+	Password          string        `json:"password"`
+	PrivateKeyPath    string        `json:"private_key_path"`
+	ListenPort        int           `json:"listen_port"`
+	TUNInterface      string        `json:"tun_interface"`
+	TUNAddress        string        `json:"tun_address"`
+	TUNGateway        string        `json:"tun_gateway"`
+	TUNMTU            int           `json:"tun_mtu"`
+	DNSServer         string        `json:"dns_server"`
+	ExcludeInterfaces []string      `json:"exclude_interfaces"`
+	LocalSubnets      []string      `json:"local_subnets"`
+	Servers           []ServerEntry `json:"servers,omitempty"`
+}
+
+// ServerEntry is one hop target. Empty fields inherit the top-level values.
+type ServerEntry struct {
+	Server         string `json:"server"`
+	Port           int    `json:"port,omitempty"`
+	User           string `json:"user,omitempty"`
+	Password       string `json:"password,omitempty"`
+	PrivateKeyPath string `json:"private_key_path,omitempty"`
+}
+
+// ServerList returns the effective server list: the servers array if present,
+// otherwise the single top-level server. Missing per-entry fields fall back
+// to the top-level credentials.
+func (c *Config) ServerList() []ServerEntry {
+	if len(c.Servers) == 0 {
+		return []ServerEntry{{
+			Server:         c.Server,
+			Port:           c.Port,
+			User:           c.User,
+			Password:       c.Password,
+			PrivateKeyPath: c.PrivateKeyPath,
+		}}
+	}
+	out := make([]ServerEntry, len(c.Servers))
+	for i, s := range c.Servers {
+		if s.Port == 0 {
+			s.Port = c.Port
+		}
+		if s.User == "" {
+			s.User = c.User
+		}
+		if s.Password == "" {
+			s.Password = c.Password
+		}
+		if s.PrivateKeyPath == "" {
+			s.PrivateKeyPath = c.PrivateKeyPath
+		}
+		out[i] = s
+	}
+	return out
 }
 
 func DefaultConfig() *Config {
@@ -68,11 +110,17 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
-	if cfg.Server == "" || cfg.User == "" {
-		return nil, fmt.Errorf("server and user are required")
+	servers := cfg.ServerList()
+	if len(servers) == 0 {
+		return nil, fmt.Errorf("server is required")
 	}
-	if cfg.Password == "" && cfg.PrivateKeyPath == "" {
-		return nil, fmt.Errorf("password or private_key_path is required")
+	for _, s := range servers {
+		if s.Server == "" {
+			return nil, fmt.Errorf("server address is required in every entry")
+		}
+		if s.Password == "" && s.PrivateKeyPath == "" {
+			return nil, fmt.Errorf("password or private_key_path is required for %s", s.Server)
+		}
 	}
 
 	return cfg, nil

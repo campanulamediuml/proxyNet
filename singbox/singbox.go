@@ -33,15 +33,17 @@ func New(exePath, configPath string) *Manager {
 
 // GenerateClientConfig returns a sing-box client JSON config that routes all
 // traffic through a local SOCKS5 proxy (the SSH tunnel endpoint).
-// serverAddr is the SSH proxy endpoint and is excluded from the tunnel to
-// avoid routing loops. dnsServer is the TCP DNS endpoint on the remote side
-// (reachable through the proxy). localSubnets are routed directly instead of
-// through the tunnel.
-func GenerateClientConfig(tunName, tunAddr string, mtu int, socksPort int, serverAddr, dnsServer string, excludeInterfaces, localSubnets []string) string {
+// serverAddrs are the SSH server endpoints; all of them are excluded from the
+// tunnel to avoid routing loops. dnsServer is the TCP DNS endpoint on the
+// remote side (reachable through the proxy). localSubnets are routed directly
+// instead of through the tunnel.
+func GenerateClientConfig(tunName, tunAddr string, mtu int, socksPort int, serverAddrs []string, dnsServer string, excludeInterfaces, localSubnets []string) string {
 	excludeJSON, _ := json.Marshal(excludeInterfaces)
 
 	excludedAddrs := append([]string{}, localSubnets...)
-	excludedAddrs = append(excludedAddrs, serverAddr+"/32")
+	for _, s := range serverAddrs {
+		excludedAddrs = append(excludedAddrs, s+"/32")
+	}
 	excludeAddrJSON, _ := json.Marshal(excludedAddrs)
 
 	return fmt.Sprintf(`{
@@ -108,8 +110,8 @@ func GenerateClientConfig(tunName, tunAddr string, mtu int, socksPort int, serve
 }
 
 // WriteConfig writes the generated config to disk.
-func (m *Manager) WriteConfig(tunName, tunAddr string, mtu int, socksPort int, serverAddr, dnsServer string, excludeInterfaces, localSubnets []string) error {
-	cfg := GenerateClientConfig(tunName, tunAddr, mtu, socksPort, serverAddr, dnsServer, excludeInterfaces, localSubnets)
+func (m *Manager) WriteConfig(tunName, tunAddr string, mtu int, socksPort int, serverAddrs []string, dnsServer string, excludeInterfaces, localSubnets []string) error {
+	cfg := GenerateClientConfig(tunName, tunAddr, mtu, socksPort, serverAddrs, dnsServer, excludeInterfaces, localSubnets)
 	return os.WriteFile(m.configPath, []byte(cfg), 0644)
 }
 
