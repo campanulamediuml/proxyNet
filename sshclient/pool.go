@@ -16,20 +16,21 @@ import (
 
 // ServerConfig describes one SSH endpoint of the pool.
 type ServerConfig struct {
-	Server  string
-	Port    int
-	User    string
+	Server   string
+	Port     int
+	User     string
 	Password string
-	KeyPath string
+	KeyPath  string
 }
 
-// Pool maintains SSH connections to multiple servers and assigns each
-// incoming SOCKS connection to a random healthy server. Existing connections
-// stay on their server until they close naturally, so hopping between servers
-// never breaks in-flight traffic.
+// Pool maintains SSH connections to multiple servers (several parallel
+// connections per server) and assigns each incoming SOCKS connection to a
+// random healthy connection. In-flight connections stay on their stream
+// until they close naturally.
 type Pool struct {
 	localAddr  string
 	remoteAddr string
+	connsPer   int
 	members    []*member
 
 	listener net.Listener
@@ -40,23 +41,32 @@ type Pool struct {
 }
 
 type member struct {
-	addr   string
-	cfg    *ssh.ClientConfig
-	mu     sync.Mutex
-	client *ssh.Client
-	down   bool // true once marked offline; used to log state changes only once
+	addr    string
+	cfg     *ssh.ClientConfig
+	target  int // number of parallel streams to maintain
+	mu      sync.Mutex
+	clients []*ssh.Client
+	down    bool // true once marked offline; used to log state changes only once
 }
 
 // NewPool creates a pool for the given servers, listening on localAddr and
 // dialing remoteAddr through the chosen server for each connection.
-func NewPool(localAddr, remoteAddr string, servers []ServerConfig) (*Pool, error) {
+// connsPer is the number of parallel SSH streams kept per server.
+func NewPool(localAddr, remoteAddr string, servers []ServerConfig, connsPer int) (*Pool, error) {
 	if len(servers) == 0 {
 		return nil, fmt.Errorf("no servers configured")
+	}
+	if connsPer < 1 {
+		connsPer = 1
+	}
+	if connsPer > 32 {
+		connsPer = 32
 	}
 
 	p := &Pool{
 		localAddr:  localAddr,
 		remoteAddr: remoteAddr,
+		connsPer:   connsPer,
 		quit:       make(chan struct{}),
 	}
 
@@ -66,8 +76,9 @@ func NewPool(localAddr, remoteAddr string, servers []ServerConfig) (*Pool, error
 			return nil, err
 		}
 		p.members = append(p.members, &member{
-			addr: fmt.Sprintf("%s:%d", s.Server, s.Port),
-			cfg:  cfg,
+			addr:   fmt.Sprintf("%s:%d", s.Server, s.Port),
+			cfg:    cfg,
+			target: connsPer,
 		})
 	}
 	return p, nil
@@ -119,14 +130,13 @@ func (p *Pool) Start() error {
 		dials.Add(1)
 		go func() {
 			defer dials.Done()
-			if err := m.dial(); err != nil {
-				// Offline hosts are simply excluded from the pool; the health
-				// loop keeps retrying them silently in the background.
+			m.topUp()
+			if m.count() == 0 {
 				m.markDown()
-				log.Printf("pool: %s offline, skipped (background retry): %v", m.addr, err)
+				log.Printf("pool: %s offline, skipped (background retry)", m.addr)
 			} else {
 				atomic.AddInt32(&okCount, 1)
-				log.Printf("pool: connected to %s", m.addr)
+				log.Printf("pool: connected to %s (%d streams)", m.addr, m.count())
 			}
 		}()
 	}
@@ -177,15 +187,13 @@ func (p *Pool) Stop() {
 	p.wg.Wait()
 }
 
-// AliveCount reports how many server connections are currently established.
+// AliveCount reports how many servers currently have at least one stream.
 func (p *Pool) AliveCount() int {
 	n := 0
 	for _, m := range p.members {
-		m.mu.Lock()
-		if m.client != nil {
+		if m.count() > 0 {
 			n++
 		}
-		m.mu.Unlock()
 	}
 	return n
 }
@@ -216,7 +224,7 @@ func (p *Pool) acceptLoop() {
 	}
 }
 
-// handleConn assigns the connection to a random healthy server.
+// handleConn assigns the connection to a random healthy stream.
 func (p *Pool) handleConn(local net.Conn) {
 	defer p.wg.Done()
 	defer local.Close()
@@ -253,14 +261,12 @@ func (p *Pool) handleConn(local net.Conn) {
 	}
 }
 
-// pick returns the ssh.Client of a random connected member, or nil if none.
+// pick returns a random established stream across all members, or nil.
 func (p *Pool) pick() *ssh.Client {
 	var alive []*ssh.Client
 	for _, m := range p.members {
 		m.mu.Lock()
-		if m.client != nil {
-			alive = append(alive, m.client)
-		}
+		alive = append(alive, m.clients...)
 		m.mu.Unlock()
 	}
 	if len(alive) == 0 {
@@ -269,9 +275,8 @@ func (p *Pool) pick() *ssh.Client {
 	return alive[rand.Intn(len(alive))]
 }
 
-// healthLoop periodically checks the member and re-dials it with backoff.
-// State changes (online -> offline, offline -> online) are logged once;
-// repeated failures of an already-offline member stay silent.
+// healthLoop prunes dead streams, tops the member back up to its target
+// stream count, and logs online/offline transitions once.
 func (p *Pool) healthLoop(m *member) {
 	defer p.wg.Done()
 
@@ -286,36 +291,115 @@ func (p *Pool) healthLoop(m *member) {
 		case <-ticker.C:
 		}
 
-		if m.alive(8 * time.Second) {
-			backoff = 5 * time.Second
-			continue
-		}
-		m.close()
+		m.pruneDead(8 * time.Second)
 
-		for {
+		if m.count() == 0 {
+			if m.markDown() {
+				log.Printf("pool: %s went offline, skipping it (background retry)", m.addr)
+			}
+			m.topUp()
+			if m.count() > 0 {
+				backoff = 5 * time.Second
+				if m.markUp() {
+					log.Printf("pool: %s back online", m.addr)
+				}
+				continue
+			}
+			backoff *= 2
+			if backoff > 60*time.Second {
+				backoff = 60 * time.Second
+			}
 			select {
 			case <-p.quit:
 				return
 			case <-time.After(backoff):
 			}
+			continue
+		}
 
-			if err := m.dial(); err != nil {
-				if m.markDown() {
-					log.Printf("pool: %s went offline, skipping it (background retry)", m.addr)
-				}
-				backoff *= 2
-				if backoff > 60*time.Second {
-					backoff = 60 * time.Second
-				}
-				continue
+		m.topUp()
+		backoff = 5 * time.Second
+	}
+}
+
+// count returns the number of established streams.
+func (m *member) count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.clients)
+}
+
+// topUp dials new streams in parallel until the member reaches its target.
+func (m *member) topUp() {
+	m.mu.Lock()
+	missing := m.target - len(m.clients)
+	m.mu.Unlock()
+	if missing <= 0 {
+		return
+	}
+
+	results := make(chan *ssh.Client, missing)
+	var wg sync.WaitGroup
+	for i := 0; i < missing; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if c, err := ssh.Dial("tcp", m.addr, m.cfg); err == nil {
+				results <- c
 			}
-			if m.markUp() {
-				log.Printf("pool: %s back online", m.addr)
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	m.mu.Lock()
+	for c := range results {
+		m.clients = append(m.clients, c)
+	}
+	m.mu.Unlock()
+}
+
+// pruneDead probes every stream and removes the ones that do not respond.
+func (m *member) pruneDead(timeout time.Duration) {
+	m.mu.Lock()
+	clients := append([]*ssh.Client(nil), m.clients...)
+	m.mu.Unlock()
+
+	dead := make(chan *ssh.Client, len(clients))
+	var wg sync.WaitGroup
+	for _, c := range clients {
+		c := c
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if !probe(c, timeout) {
+				dead <- c
 			}
-			backoff = 5 * time.Second
-			break
+		}()
+	}
+	wg.Wait()
+	close(dead)
+
+	m.mu.Lock()
+	for d := range dead {
+		_ = d.Close()
+		for i, c := range m.clients {
+			if c == d {
+				m.clients = append(m.clients[:i], m.clients[i+1:]...)
+				break
+			}
 		}
 	}
+	m.mu.Unlock()
+}
+
+func (m *member) close() {
+	m.mu.Lock()
+	for _, c := range m.clients {
+		_ = c.Close()
+	}
+	m.clients = nil
+	m.mu.Unlock()
 }
 
 // markDown transitions the member to the offline state, returning true only
@@ -342,36 +426,10 @@ func (m *member) markUp() bool {
 	return true
 }
 
-func (m *member) dial() error {
-	client, err := ssh.Dial("tcp", m.addr, m.cfg)
-	if err != nil {
-		return err
-	}
-	m.mu.Lock()
-	m.client = client
-	m.mu.Unlock()
-	return nil
-}
-
-func (m *member) close() {
-	m.mu.Lock()
-	if m.client != nil {
-		_ = m.client.Close()
-		m.client = nil
-	}
-	m.mu.Unlock()
-}
-
-// alive reports whether the member's connection responds to a keepalive
-// request within timeout.
-func (m *member) alive(timeout time.Duration) bool {
-	m.mu.Lock()
-	client := m.client
-	m.mu.Unlock()
-	if client == nil {
-		return false
-	}
-
+// probe reports whether the connection responds to a keepalive request
+// within timeout. sshd replies even to unknown request names (with failure),
+// which still proves the connection is alive.
+func probe(client *ssh.Client, timeout time.Duration) bool {
 	done := make(chan error, 1)
 	go func() {
 		_, _, err := client.SendRequest("keepalive@proxynet", true, nil)
