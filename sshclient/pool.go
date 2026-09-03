@@ -47,6 +47,11 @@ type member struct {
 	mu      sync.Mutex
 	clients []*ssh.Client
 	down    bool // true once marked offline; used to log state changes only once
+
+	activeConns int64
+	totalConns  int64
+	bytesUp     int64
+	bytesDown   int64
 }
 
 // NewPool creates a pool for the given servers, listening on localAddr and
@@ -230,14 +235,16 @@ func (p *Pool) handleConn(local net.Conn) {
 	defer local.Close()
 
 	var remote net.Conn
+	var chosen *member
 	for attempt := 0; attempt < 3 && remote == nil; attempt++ {
-		c := p.pick()
+		m, c := p.pick()
 		if c == nil {
 			break
 		}
 		r, err := c.Dial("tcp", p.remoteAddr)
 		if err == nil {
 			remote = r
+			chosen = m
 		}
 	}
 	if remote == nil {
@@ -245,13 +252,17 @@ func (p *Pool) handleConn(local net.Conn) {
 	}
 	defer remote.Close()
 
+	atomic.AddInt64(&chosen.activeConns, 1)
+	atomic.AddInt64(&chosen.totalConns, 1)
+	defer atomic.AddInt64(&chosen.activeConns, -1)
+
 	errChan := make(chan error, 2)
 	go func() {
-		_, err := io.Copy(remote, local)
+		_, err := io.Copy(&countingWriter{w: remote, n: &chosen.bytesUp}, local)
 		errChan <- err
 	}()
 	go func() {
-		_, err := io.Copy(local, remote)
+		_, err := io.Copy(&countingWriter{w: local, n: &chosen.bytesDown}, remote)
 		errChan <- err
 	}()
 
@@ -261,18 +272,68 @@ func (p *Pool) handleConn(local net.Conn) {
 	}
 }
 
-// pick returns a random established stream across all members, or nil.
-func (p *Pool) pick() *ssh.Client {
-	var alive []*ssh.Client
+// countingWriter increments an atomic counter as bytes are written.
+type countingWriter struct {
+	w io.Writer
+	n *int64
+}
+
+func (cw *countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	if n > 0 {
+		atomic.AddInt64(cw.n, int64(n))
+	}
+	return n, err
+}
+
+// pick returns a random member with an established stream, or nil.
+func (p *Pool) pick() (*member, *ssh.Client) {
+	var aliveM []*member
+	var aliveC []*ssh.Client
 	for _, m := range p.members {
 		m.mu.Lock()
-		alive = append(alive, m.clients...)
+		for _, c := range m.clients {
+			aliveM = append(aliveM, m)
+			aliveC = append(aliveC, c)
+		}
 		m.mu.Unlock()
 	}
-	if len(alive) == 0 {
-		return nil
+	if len(aliveC) == 0 {
+		return nil, nil
 	}
-	return alive[rand.Intn(len(alive))]
+	i := rand.Intn(len(aliveC))
+	return aliveM[i], aliveC[i]
+}
+
+// MemberStats is a per-server traffic snapshot.
+type MemberStats struct {
+	Addr        string
+	Streams     int
+	ActiveConns int64
+	TotalConns  int64
+	BytesUp     int64
+	BytesDown   int64
+	Online      bool
+}
+
+// Stats returns a traffic snapshot for every server in the pool.
+func (p *Pool) Stats() []MemberStats {
+	out := make([]MemberStats, 0, len(p.members))
+	for _, m := range p.members {
+		m.mu.Lock()
+		streams := len(m.clients)
+		m.mu.Unlock()
+		out = append(out, MemberStats{
+			Addr:        m.addr,
+			Streams:     streams,
+			ActiveConns: atomic.LoadInt64(&m.activeConns),
+			TotalConns:  atomic.LoadInt64(&m.totalConns),
+			BytesUp:     atomic.LoadInt64(&m.bytesUp),
+			BytesDown:   atomic.LoadInt64(&m.bytesDown),
+			Online:      streams > 0,
+		})
+	}
+	return out
 }
 
 // healthLoop prunes dead streams, tops the member back up to its target

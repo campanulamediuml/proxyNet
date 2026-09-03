@@ -10,18 +10,21 @@ import (
 type Tray struct {
 	onConnect    func()
 	onDisconnect func()
+	onStats      func()
 	onExit       func()
 
 	statusItem     *systray.MenuItem
 	connectItem    *systray.MenuItem
 	disconnectItem *systray.MenuItem
+	statsItem      *systray.MenuItem
 }
 
 // New creates a Tray with the given callbacks.
-func New(onConnect, onDisconnect, onExit func()) *Tray {
+func New(onConnect, onDisconnect, onStats, onExit func()) *Tray {
 	return &Tray{
 		onConnect:    onConnect,
 		onDisconnect: onDisconnect,
+		onStats:      onStats,
 		onExit:       onExit,
 	}
 }
@@ -49,6 +52,8 @@ func (t *Tray) onReady() {
 	t.disconnectItem = systray.AddMenuItem("Disconnect", "Stop proxy tunnel")
 	t.disconnectItem.Hide()
 
+	t.statsItem = systray.AddMenuItem("Traffic stats", "Show per-server traffic statistics")
+
 	mExit := systray.AddMenuItem("Exit", "Quit proxyNet")
 
 	go func() {
@@ -61,6 +66,10 @@ func (t *Tray) onReady() {
 			case <-t.disconnectItem.ClickedCh:
 				if t.onDisconnect != nil {
 					go t.onDisconnect()
+				}
+			case <-t.statsItem.ClickedCh:
+				if t.onStats != nil {
+					go t.onStats()
 				}
 			case <-mExit.ClickedCh:
 				if t.onExit != nil {

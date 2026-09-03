@@ -3,3 +3,4 @@ dist/
 config.json
 *.log
 .idea/
+/setup-vm.ps1

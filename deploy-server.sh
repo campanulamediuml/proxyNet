@@ -55,7 +55,7 @@ echo "=== [2/5] 服务端配置 ==="
 cat > /etc/sing-box-server.json <<'EOF'
 {
   "log": {
-    "level": "info"
+    "level": "warn"
   },
   "inbounds": [
     {

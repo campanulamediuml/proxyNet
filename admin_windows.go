@@ -35,6 +35,19 @@ func isAdmin() bool {
 	return member
 }
 
+// openURL opens a URL in the default browser.
+func openURL(url string) {
+	verb := "open"
+	_ = windows.ShellExecute(
+		0,
+		syscall.StringToUTF16Ptr(verb),
+		syscall.StringToUTF16Ptr(url),
+		nil,
+		nil,
+		windows.SW_NORMAL,
+	)
+}
+
 // runAsAdmin restarts the current executable with UAC elevation.
 func runAsAdmin() error {
 	exe, err := os.Executable()

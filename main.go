@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,6 +31,9 @@ type App struct {
 	connected  bool
 	dnsApplied bool
 	watchStop  chan struct{}
+
+	ratesMu sync.Mutex
+	rates   map[string][2]int64 // server addr -> [up bytes/s, down bytes/s]
 }
 
 func main() {
@@ -128,8 +132,11 @@ func main() {
 	app.systray = tray.New(
 		app.connect,
 		app.disconnect,
+		app.showStats,
 		app.exit,
 	)
+
+	app.startStatsServer()
 
 	log.Println("Starting tray UI")
 	app.systray.Run()
@@ -260,6 +267,7 @@ func (a *App) watchdog(stop chan struct{}) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	failures := 0
+	ticks := 0
 
 	for {
 		select {
@@ -278,6 +286,13 @@ func (a *App) watchdog(stop chan struct{}) {
 		sbDead := a.sb.Err() != nil
 		if !sshDead && !sbDead {
 			failures = 0
+			ticks++
+			if ticks >= 12 { // roughly every minute
+				ticks = 0
+				for _, line := range strings.Split(a.statsText(), "\n") {
+					log.Println("stats: " + line)
+				}
+			}
 			a.mu.Unlock()
 			continue
 		}
@@ -361,6 +376,186 @@ func (a *App) exit() {
 	time.Sleep(200 * time.Millisecond)
 	a.systray.Exit()
 	os.Exit(0)
+}
+
+// showStats opens the live stats page in the default browser.
+func (a *App) showStats() {
+	openURL("http://127.0.0.1:10011/")
+}
+
+// startStatsServer serves a self-refreshing traffic stats page on
+// 127.0.0.1:10011. It runs for the lifetime of the process.
+func (a *App) startStatsServer() {
+	a.startRateSampler()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", a.statsHandler)
+	srv := &http.Server{Addr: "127.0.0.1:10011", Handler: mux}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil {
+			log.Printf("stats server: %v", err)
+		}
+	}()
+	log.Println("stats page: http://127.0.0.1:10011/")
+}
+
+// startRateSampler samples pool counters every 2s and derives per-server
+// throughput rates (bytes/sec).
+func (a *App) startRateSampler() {
+	type prevSample struct {
+		up, down int64
+		at       time.Time
+	}
+	last := map[string]prevSample{}
+
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			a.mu.Lock()
+			pool := a.pool
+			a.mu.Unlock()
+
+			rates := map[string][2]int64{}
+			if pool != nil {
+				now := time.Now()
+				for _, s := range pool.Stats() {
+					if p, ok := last[s.Addr]; ok {
+						dt := now.Sub(p.at).Seconds()
+						if dt > 0 {
+							up := int64(float64(s.BytesUp-p.up) / dt)
+							down := int64(float64(s.BytesDown-p.down) / dt)
+							if up < 0 {
+								up = 0
+							}
+							if down < 0 {
+								down = 0
+							}
+							rates[s.Addr] = [2]int64{up, down}
+						}
+					}
+					last[s.Addr] = prevSample{up: s.BytesUp, down: s.BytesDown, at: now}
+				}
+			}
+			a.ratesMu.Lock()
+			a.rates = rates
+			a.ratesMu.Unlock()
+		}
+	}()
+}
+
+// rateOf returns the current [up, down] bytes/sec for a server.
+func (a *App) rateOf(addr string) (int64, int64) {
+	a.ratesMu.Lock()
+	defer a.ratesMu.Unlock()
+	r := a.rates[addr]
+	return r[0], r[1]
+}
+
+func (a *App) statsHandler(w http.ResponseWriter, r *http.Request) {
+	a.mu.Lock()
+	pool := a.pool
+	connected := a.connected
+	a.mu.Unlock()
+
+	var rows strings.Builder
+	var totalUp, totalDown, totalConns, totalActive int64
+	var totalUpRate, totalDownRate int64
+	if pool != nil {
+		for _, s := range pool.Stats() {
+			state := `<span style="color:#4ec9b0">在线</span>`
+			if !s.Online {
+				state = `<span style="color:#f44747">离线</span>`
+			}
+			upRate, downRate := a.rateOf(s.Addr)
+			fmt.Fprintf(&rows, "<tr><td>%s</td><td>%s</td><td>%d</td><td>%d</td><td>%d</td><td>%s</td><td>%s</td><td>%s/s</td><td>%s/s</td></tr>\n",
+				s.Addr, state, s.Streams, s.ActiveConns, s.TotalConns,
+				humanBytes(s.BytesUp), humanBytes(s.BytesDown),
+				humanBytes(upRate), humanBytes(downRate))
+			totalUp += s.BytesUp
+			totalDown += s.BytesDown
+			totalConns += s.TotalConns
+			totalActive += s.ActiveConns
+			totalUpRate += upRate
+			totalDownRate += downRate
+		}
+	}
+
+	status := "未连接"
+	if connected {
+		status = "已连接"
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, `<!doctype html><html><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="3">
+<title>proxyNet 流量统计</title>
+<style>
+body{font-family:Consolas,Menlo,monospace;background:#1e1e1e;color:#d4d4d4;padding:20px}
+h3{margin:0 0 12px}
+table{border-collapse:collapse}
+th,td{padding:6px 14px;border-bottom:1px solid #333;text-align:right}
+th{color:#9cdcfe}
+td:first-child,th:first-child{text-align:left}
+.total{margin-top:12px;color:#ce9178}
+.meta{margin-top:8px;color:#666;font-size:12px}
+</style></head><body>
+<h3>proxyNet 流量统计 <small style="color:#666">%s</small></h3>
+<table><tr><th>服务器</th><th>状态</th><th>流数</th><th>活跃</th><th>累计连接</th><th>上行</th><th>下行</th><th>上行速度</th><th>下行速度</th></tr>
+%s</table>
+<div class="total">总计: 活跃 %d / 累计 %d  ↑%s ↓%s（↑%s/s ↓%s/s）</div>
+<div class="meta">每 3 秒自动刷新 · %s</div>
+</body></html>`, status, rows.String(), totalActive, totalConns,
+		humanBytes(totalUp), humanBytes(totalDown),
+		humanBytes(totalUpRate), humanBytes(totalDownRate),
+		time.Now().Format("15:04:05"))
+}
+
+// statsText formats pool statistics as a multi-line block with a total line.
+func (a *App) statsText() string {
+	stats := a.pool.Stats()
+
+	var totalUp, totalDown, totalConns, totalActive int64
+	var totalUpRate, totalDownRate int64
+	for _, s := range stats {
+		totalUp += s.BytesUp
+		totalDown += s.BytesDown
+		totalConns += s.TotalConns
+		totalActive += s.ActiveConns
+		up, down := a.rateOf(s.Addr)
+		totalUpRate += up
+		totalDownRate += down
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "总计: 活跃 %d / 累计 %d  ↑%s ↓%s（↑%s/s ↓%s/s）", totalActive, totalConns,
+		humanBytes(totalUp), humanBytes(totalDown),
+		humanBytes(totalUpRate), humanBytes(totalDownRate))
+	for _, s := range stats {
+		state := "在线"
+		if !s.Online {
+			state = "离线"
+		}
+		upRate, downRate := a.rateOf(s.Addr)
+		fmt.Fprintf(&b, "\n%s [%s] 流:%d 活跃:%d 累计:%d ↑%s ↓%s（↑%s/s ↓%s/s）",
+			s.Addr, state, s.Streams, s.ActiveConns, s.TotalConns,
+			humanBytes(s.BytesUp), humanBytes(s.BytesDown),
+			humanBytes(upRate), humanBytes(downRate))
+	}
+	return b.String()
+}
+
+// humanBytes renders a byte count in a human-readable form.
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%dB", n)
+	}
+	div, exp := int64(unit), 0
+	for x := n / unit; x >= unit; x /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%cB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 func getExeDir() (string, error) {
