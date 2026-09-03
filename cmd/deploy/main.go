@@ -234,6 +234,7 @@ func buildSSHConfig(s serverEntry) (*ssh.ClientConfig, error) {
 		Auth:            auth,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         15 * time.Second,
+		ClientVersion:   "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.13",
 	}, nil
 }
 

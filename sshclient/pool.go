@@ -115,6 +115,8 @@ func buildSSHConfig(s ServerConfig) (*ssh.ClientConfig, error) {
 		Auth:            authMethods,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         10 * time.Second,
+		// Present as an ordinary OpenSSH client instead of "SSH-2.0-Go".
+		ClientVersion: "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.13",
 	}, nil
 }
 
@@ -493,7 +495,7 @@ func (m *member) markUp() bool {
 func probe(client *ssh.Client, timeout time.Duration) bool {
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := client.SendRequest("keepalive@proxynet", true, nil)
+		_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
 		done <- err
 	}()
 	select {

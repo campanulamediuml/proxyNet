@@ -26,6 +26,7 @@ func main() {
 		Auth:            []ssh.AuthMethod{ssh.Password(*pass)},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         10 * time.Second,
+		ClientVersion:   "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.13",
 	}
 
 	client, err := ssh.Dial("tcp", *host, config)
