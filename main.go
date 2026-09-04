@@ -27,10 +27,11 @@ type App struct {
 	sb         *singbox.Manager
 	dnsManager *route.DNSManager
 	systray    *tray.Tray
-	mu         sync.Mutex
-	connected  bool
-	dnsApplied bool
-	watchStop  chan struct{}
+	mu          sync.Mutex
+	connected   bool
+	dnsApplied  bool
+	watchStop   chan struct{}
+	connectedAt time.Time
 
 	ratesMu sync.Mutex
 	rates   map[string][2]int64 // server addr -> [up bytes/s, down bytes/s]
@@ -180,11 +181,26 @@ func (a *App) connect() {
 	}
 
 	a.connected = true
+	a.connectedAt = time.Now()
 	a.watchStop = make(chan struct{})
 	go a.watchdog(a.watchStop)
 	a.systray.SetConnected(true)
 	a.systray.SetStatus("connected")
 	log.Println("Connected")
+}
+
+// uptimeText returns how long the tunnel has been connected, like "1h23m".
+func (a *App) uptimeText() string {
+	if !a.connected || a.connectedAt.IsZero() {
+		return ""
+	}
+	d := time.Since(a.connectedAt).Round(time.Minute)
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%dh%02dm", h, m)
+	}
+	return fmt.Sprintf("%dm", m)
 }
 
 // startTunnel establishes the SSH connection pool and starts sing-box,
@@ -292,6 +308,7 @@ func (a *App) watchdog(stop chan struct{}) {
 				for _, line := range strings.Split(a.statsText(), "\n") {
 					log.Println("stats: " + line)
 				}
+				a.systray.SetStatus(fmt.Sprintf("connected (%s)", a.uptimeText()))
 			}
 			a.mu.Unlock()
 			continue
@@ -365,6 +382,7 @@ func (a *App) disconnect() {
 	}
 
 	a.connected = false
+	a.connectedAt = time.Time{}
 	a.systray.SetConnected(false)
 	a.systray.SetStatus("disconnected")
 	log.Println("Disconnected")
@@ -483,6 +501,9 @@ func (a *App) statsHandler(w http.ResponseWriter, r *http.Request) {
 	status := "未连接"
 	if connected {
 		status = "已连接"
+		if up := a.uptimeText(); up != "" {
+			status = "已连接 · 运行 " + up
+		}
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

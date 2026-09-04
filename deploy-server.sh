@@ -142,6 +142,7 @@ if ! command -v dnsmasq >/dev/null 2>&1; then
     apt-get install -y -qq dnsmasq || echo "WARN: dnsmasq 安装失败"
 fi
 if command -v dnsmasq >/dev/null 2>&1; then
+    mkdir -p /etc/dnsmasq.d
     cat > /etc/dnsmasq.d/proxynet.conf <<'EOF'
 # proxyNet DNS forwarder: TCP/UDP on 127.0.0.1:53, forward to company DNS
 listen-address=127.0.0.1
@@ -150,6 +151,23 @@ no-dhcp-interface=lo
 no-resolv
 server=192.168.3.250
 EOF
+    # 老系统（如 Ubuntu 18.04 只有 dnsmasq-base）没有官方 unit，补一个自己的
+    if ! systemctl cat dnsmasq.service >/dev/null 2>&1; then
+        cat > /etc/systemd/system/dnsmasq.service <<'EOF'
+[Unit]
+Description=dnsmasq DNS forwarder (proxyNet)
+After=network.target
+
+[Service]
+ExecStart=/usr/sbin/dnsmasq -k --conf-file=/etc/dnsmasq.d/proxynet.conf
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+    fi
     systemctl enable dnsmasq 2>/dev/null || true
     systemctl restart dnsmasq || echo "WARN: dnsmasq 重启失败"
     echo "dnsmasq service: $(systemctl is-active dnsmasq)"

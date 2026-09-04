@@ -128,6 +128,7 @@ func (m *Manager) Start() error {
 	cmd.Stdout = io.MultiWriter(os.Stdout, tw)
 	cmd.Stderr = io.MultiWriter(os.Stderr, tw)
 	cmd.Dir = filepath.Dir(m.configPath)
+	hideWindow(cmd)
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start sing-box: %w", err)
