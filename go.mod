@@ -5,8 +5,8 @@ go 1.26.4
 require (
 	github.com/getlantern/systray v1.2.2
 	github.com/pkg/sftp v1.13.11
-	golang.org/x/crypto v0.55.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/crypto v0.57.0
+	golang.org/x/sys v0.48.0
 )
 
 require (
