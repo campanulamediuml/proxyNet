@@ -94,6 +94,10 @@ func (d *DNSManager) RecoverIfNeeded() (bool, error) {
 // and then clears their DNS server addresses. It also lowers the TUN metric
 // and raises physical adapter metrics so Windows prefers TUN. All operations
 // are batched into a single PowerShell invocation to keep connect fast.
+//
+// Anti-poisoning: adapters whose current DNS is already our blackhole marker
+// keep the previous backup's values (matched by adapter GUID) instead of
+// recording the blackhole as the "original" configuration.
 func (d *DNSManager) BackupAndClear() error {
 	interfaces, err := d.listConfig()
 	if err != nil {
@@ -102,6 +106,35 @@ func (d *DNSManager) BackupAndClear() error {
 
 	if len(interfaces) == 0 {
 		return nil
+	}
+
+	// Load previous backup so blackholed adapters keep their real values.
+	prev := map[string]InterfaceConfig{}
+	if data, err := os.ReadFile(d.backupPath); err == nil {
+		var old []InterfaceConfig
+		if json.Unmarshal(data, &old) == nil {
+			for _, o := range old {
+				if o.InterfaceGuid != "" {
+					prev[o.InterfaceGuid] = o
+				}
+			}
+		}
+	}
+
+	for i, iface := range interfaces {
+		if iface.InterfaceGuid == "" || iface.IsTUN {
+			continue
+		}
+		o, ok := prev[iface.InterfaceGuid]
+		if !ok {
+			continue
+		}
+		if isBlackhole(iface.IPv4Servers, "127.0.0.1") && !isBlackhole(o.IPv4Servers, "127.0.0.1") {
+			interfaces[i].IPv4Servers = o.IPv4Servers
+		}
+		if isBlackhole(iface.IPv6Servers, "::1") && !isBlackhole(o.IPv6Servers, "::1") {
+			interfaces[i].IPv6Servers = o.IPv6Servers
+		}
 	}
 
 	backup, err := json.MarshalIndent(interfaces, "", "  ")
@@ -172,14 +205,18 @@ func (d *DNSManager) Restore() error {
 		return fmt.Errorf("parse backup: %w", err)
 	}
 
-	// Which adapters currently have DNS client objects.
-	present := map[int]bool{}
+	// Which adapters currently exist, mapped by GUID (stable across reboots,
+	// unlike InterfaceIndex which can shift when adapters are re-created).
+	byGuid := map[string]int{}
+	guidKnown := true
 	if current, err := d.listConfig(); err == nil {
 		for _, c := range current {
-			present[c.InterfaceIndex] = true
+			if c.InterfaceGuid != "" {
+				byGuid[c.InterfaceGuid] = c.InterfaceIndex
+			}
 		}
 	} else {
-		present = nil // unknown; try cmdlets for everything
+		guidKnown = false // unknown; try cmdlets with stored indexes
 	}
 
 	var sb strings.Builder
@@ -187,18 +224,18 @@ func (d *DNSManager) Restore() error {
 
 	regRestored := 0
 	for _, iface := range interfaces {
-		idx := iface.InterfaceIndex
 		// Skip the TUN adapter: at disconnect time sing-box has already been
 		// stopped and the adapter is gone, so there is nothing to restore.
-		if iface.IsTUN || idx <= 0 || idx == 1 || strings.HasPrefix(strings.ToLower(iface.InterfaceAlias), "loopback") {
+		if iface.IsTUN || iface.InterfaceIndex <= 0 || iface.InterfaceIndex == 1 || strings.HasPrefix(strings.ToLower(iface.InterfaceAlias), "loopback") {
 			continue
 		}
+		if iface.InterfaceGuid == "" {
+			continue // cannot match reliably without a GUID
+		}
 
-		if present != nil && !present[idx] {
+		idx, present := byGuid[iface.InterfaceGuid]
+		if guidKnown && !present {
 			// Adapter absent: restore via registry, effective on its return.
-			if iface.InterfaceGuid == "" {
-				continue
-			}
 			if len(iface.IPv4Servers) > 0 {
 				fmt.Fprintf(&sb, "try { Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\%s' -Name 'NameServer' -Value '%s' -ErrorAction Stop } catch {}\n",
 					iface.InterfaceGuid, strings.Join(iface.IPv4Servers, ","))
@@ -209,6 +246,9 @@ func (d *DNSManager) Restore() error {
 			}
 			regRestored++
 			continue
+		}
+		if !guidKnown {
+			idx = iface.InterfaceIndex // fallback when current state unknown
 		}
 
 		if len(iface.IPv4Servers) > 0 {
@@ -240,6 +280,11 @@ func (d *DNSManager) Restore() error {
 	// The backup file is kept permanently: the company network uses static
 	// IP/MAC binding, so the backed-up values stay correct for these adapters.
 	return nil
+}
+
+// isBlackhole reports whether the server list is exactly our blackhole marker.
+func isBlackhole(servers []string, marker string) bool {
+	return len(servers) == 1 && servers[0] == marker
 }
 
 // psStringArray renders a PowerShell string array literal.

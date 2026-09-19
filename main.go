@@ -22,11 +22,11 @@ import (
 
 // App orchestrates the SSH tunnel, sing-box client and tray UI.
 type App struct {
-	cfg        *Config
-	pool       *sshclient.Pool
-	sb         *singbox.Manager
-	dnsManager *route.DNSManager
-	systray    *tray.Tray
+	cfg         *Config
+	pool        *sshclient.Pool
+	sb          *singbox.Manager
+	dnsManager  *route.DNSManager
+	systray     *tray.Tray
 	mu          sync.Mutex
 	connected   bool
 	dnsApplied  bool
@@ -35,6 +35,9 @@ type App struct {
 
 	ratesMu sync.Mutex
 	rates   map[string][2]int64 // server addr -> [up bytes/s, down bytes/s]
+
+	healthMu sync.Mutex
+	health   map[string]serverHealth // server addr -> latest probe result
 }
 
 func main() {
@@ -70,6 +73,14 @@ func main() {
 	log.Println("Running with admin privileges")
 
 	flag.Parse()
+
+	// Resolve the default config path relative to the executable so desktop
+	// shortcuts with any "Start in" directory still find the shipped config.
+	// An explicit -config flag is honored as-is.
+	if !configFlagExplicitlySet() && !filepath.IsAbs(*configPath) {
+		*configPath = filepath.Join(exeDir, *configPath)
+	}
+	log.Printf("Using config: %s", *configPath)
 
 	backupPath := filepath.Join(exeDir, "dns_backup.json")
 
@@ -166,6 +177,10 @@ func (a *App) connect() {
 	log.Println("Connecting...")
 	a.systray.SetStatus("connecting...")
 
+	if err := a.reloadConfig(); err != nil {
+		log.Printf("config reload failed, using cached config: %v", err)
+	}
+
 	if err := a.startTunnel(); err != nil {
 		log.Printf("Connect failed: %v", err)
 		a.systray.SetStatus(fmt.Sprintf("connect failed: %v", err))
@@ -201,6 +216,28 @@ func (a *App) uptimeText() string {
 		return fmt.Sprintf("%dh%02dm", h, m)
 	}
 	return fmt.Sprintf("%dm", m)
+}
+
+// configFlagExplicitlySet reports whether -config was passed on the command line.
+func configFlagExplicitlySet() bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "config" {
+			set = true
+		}
+	})
+	return set
+}
+
+// reloadConfig re-reads config.json from disk so server list and other
+// settings can be changed without restarting the program.
+func (a *App) reloadConfig() error {
+	cfg, err := LoadConfig()
+	if err != nil {
+		return err
+	}
+	a.cfg = cfg
+	return nil
 }
 
 // startTunnel establishes the SSH connection pool and starts sing-box,
@@ -339,6 +376,9 @@ func (a *App) watchdog(stop chan struct{}) {
 			a.mu.Unlock()
 			return
 		}
+		if err := a.reloadConfig(); err != nil {
+			log.Printf("watchdog: config reload failed, using cached config: %v", err)
+		}
 		if err := a.startTunnel(); err != nil {
 			log.Printf("watchdog: reconnect failed: %v", err)
 			a.systray.SetStatus(fmt.Sprintf("reconnect failed: %v", err))
@@ -401,12 +441,22 @@ func (a *App) showStats() {
 	openURL("http://127.0.0.1:10011/")
 }
 
-// startStatsServer serves a self-refreshing traffic stats page on
-// 127.0.0.1:10011. It runs for the lifetime of the process.
+// startStatsServer serves the live traffic stats page on 127.0.0.1:10011.
+// It runs for the lifetime of the process.
 func (a *App) startStatsServer() {
+	a.health = map[string]serverHealth{}
 	a.startRateSampler()
+	// Periodically probe server-side health (sing-box/dnsmasq/outbound).
+	go func() {
+		for {
+			a.probeServers()
+			time.Sleep(60 * time.Second)
+		}
+	}()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", a.statsHandler)
+	mux.HandleFunc("/api/stats", a.statsAPIHandler)
 	srv := &http.Server{Addr: "127.0.0.1:10011", Handler: mux}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil {
@@ -416,8 +466,97 @@ func (a *App) startStatsServer() {
 	log.Println("stats page: http://127.0.0.1:10011/")
 }
 
-// startRateSampler samples pool counters every 2s and derives per-server
-// throughput rates (bytes/sec).
+// serverHealth is the result of probing one server's proxy-side services.
+type serverHealth struct {
+	At    time.Time
+	Err   string // ssh-level failure, empty means reachable
+	SB    string // sing-box service state
+	DM    string // dnsmasq service state
+	Socks string // listener count on 127.0.0.1:10010
+	DNS53 string // listener count on 127.0.0.1:53
+	Ping  string // outbound ping
+	HTTP  string // outbound https status code
+}
+
+const serverProbeScript = `
+SB=$(systemctl is-active sing-box 2>/dev/null || echo missing)
+DM=$(systemctl is-active dnsmasq 2>/dev/null || echo missing)
+S10010=$(ss -tln 2>/dev/null | grep -c '127.0.0.1:10010' || true)
+S53=$(ss -tln 2>/dev/null | grep -c '127.0.0.1:53' || true)
+PING=$(ping -c 1 -W 3 baidu.com >/dev/null 2>&1 && echo ok || echo fail)
+HTTP=$(curl -m 6 -s -o /dev/null -w '%{http_code}' https://www.baidu.com 2>/dev/null || echo 000)
+echo "SB=$SB DM=$DM SOCKS=$S10010 DNS53=$S53 PING=$PING HTTP=$HTTP"
+`
+
+// probeServers probes all configured servers in parallel and stores results.
+func (a *App) probeServers() {
+	servers := a.cfg.ServerList()
+	var wg sync.WaitGroup
+	for _, s := range servers {
+		s := s
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			h := probeServer(s)
+			// Key by the same host:port form the pool uses (pool.go member.addr)
+			// so the stats page can match health to a pool member.
+			key := fmt.Sprintf("%s:%d", s.Server, s.Port)
+			a.healthMu.Lock()
+			a.health[key] = h
+			a.healthMu.Unlock()
+		}()
+	}
+	wg.Wait()
+}
+
+func probeServer(s ServerEntry) serverHealth {
+	h := serverHealth{At: time.Now()}
+	client, err := sshclient.DialServer(sshclient.ServerConfig{
+		Server:   s.Server,
+		Port:     s.Port,
+		User:     s.User,
+		Password: s.Password,
+		KeyPath:  s.PrivateKeyPath,
+	})
+	if err != nil {
+		h.Err = err.Error()
+		return h
+	}
+	defer client.Close()
+
+	session, err := client.NewSession()
+	if err != nil {
+		h.Err = err.Error()
+		return h
+	}
+	defer session.Close()
+
+	out, err := session.Output(serverProbeScript)
+	if err != nil {
+		h.Err = err.Error()
+		return h
+	}
+
+	kv := map[string]string{}
+	for _, field := range strings.Fields(strings.TrimSpace(string(out))) {
+		parts := strings.SplitN(field, "=", 2)
+		if len(parts) == 2 {
+			kv[parts[0]] = parts[1]
+		}
+	}
+	h.SB, h.DM = kv["SB"], kv["DM"]
+	h.Socks, h.DNS53 = kv["SOCKS"], kv["DNS53"]
+	h.Ping, h.HTTP = kv["PING"], kv["HTTP"]
+	return h
+}
+
+// healthOf returns the latest probe result for a server.
+func (a *App) healthOf(addr string) (serverHealth, bool) {
+	a.healthMu.Lock()
+	defer a.healthMu.Unlock()
+	h, ok := a.health[addr]
+	return h, ok
+}
 func (a *App) startRateSampler() {
 	type prevSample struct {
 		up, down int64
@@ -469,26 +608,55 @@ func (a *App) rateOf(addr string) (int64, int64) {
 	return r[0], r[1]
 }
 
+// statsHandler serves the static stats page. The page polls /api/stats via
+// fetch and updates in place, so it never reloads or steals window focus.
 func (a *App) statsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, statsPageHTML)
+}
+
+// statsAPIHandler returns the current pool stats and server health as JSON.
+func (a *App) statsAPIHandler(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	pool := a.pool
 	connected := a.connected
 	a.mu.Unlock()
 
-	var rows strings.Builder
-	var totalUp, totalDown, totalConns, totalActive int64
-	var totalUpRate, totalDownRate int64
+	type serverJSON struct {
+		Addr     string `json:"addr"`
+		Online   bool   `json:"online"`
+		Streams  int    `json:"streams"`
+		Active   int64  `json:"active"`
+		Total    int64  `json:"total"`
+		Up       string `json:"up"`
+		Down     string `json:"down"`
+		UpRate   string `json:"upRate"`
+		DownRate string `json:"downRate"`
+		Health   string `json:"health"`
+		HealthAt string `json:"healthAt"`
+	}
+
+	servers := []serverJSON{}
+	var totalUp, totalDown, totalConns, totalActive, totalUpRate, totalDownRate int64
 	if pool != nil {
 		for _, s := range pool.Stats() {
-			state := `<span style="color:#4ec9b0">在线</span>`
-			if !s.Online {
-				state = `<span style="color:#f44747">离线</span>`
-			}
 			upRate, downRate := a.rateOf(s.Addr)
-			fmt.Fprintf(&rows, "<tr><td>%s</td><td>%s</td><td>%d</td><td>%d</td><td>%d</td><td>%s</td><td>%s</td><td>%s/s</td><td>%s/s</td></tr>\n",
-				s.Addr, state, s.Streams, s.ActiveConns, s.TotalConns,
-				humanBytes(s.BytesUp), humanBytes(s.BytesDown),
-				humanBytes(upRate), humanBytes(downRate))
+			sj := serverJSON{
+				Addr: s.Addr, Online: s.Online, Streams: s.Streams,
+				Active: s.ActiveConns, Total: s.TotalConns,
+				Up: humanBytes(s.BytesUp), Down: humanBytes(s.BytesDown),
+				UpRate: humanBytes(upRate), DownRate: humanBytes(downRate),
+				Health: "未检测",
+			}
+			if h, ok := a.healthOf(s.Addr); ok {
+				sj.HealthAt = h.At.Format("15:04:05")
+				if h.Err != "" {
+					sj.Health = "SSH不可达"
+				} else {
+					sj.Health = fmt.Sprintf("sing-box:%s dns:%s 出网:%s", h.SB, h.DM, h.HTTP)
+				}
+			}
+			servers = append(servers, sj)
 			totalUp += s.BytesUp
 			totalDown += s.BytesDown
 			totalConns += s.TotalConns
@@ -502,13 +670,21 @@ func (a *App) statsHandler(w http.ResponseWriter, r *http.Request) {
 	if connected {
 		status = "已连接"
 		if up := a.uptimeText(); up != "" {
-			status = "已连接 · 运行 " + up
+			status += " · 运行 " + up
 		}
 	}
 
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, `<!doctype html><html><head><meta charset="utf-8">
-<meta http-equiv="refresh" content="3">
+	out := map[string]interface{}{
+		"status":    status,
+		"servers":   servers,
+		"total":     fmt.Sprintf("活跃 %d / 累计 %d  ↑%s ↓%s（↑%s/s ↓%s/s）", totalActive, totalConns, humanBytes(totalUp), humanBytes(totalDown), humanBytes(totalUpRate), humanBytes(totalDownRate)),
+		"updatedAt": time.Now().Format("15:04:05"),
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+const statsPageHTML = `<!doctype html><html><head><meta charset="utf-8">
 <title>proxyNet 流量统计</title>
 <style>
 body{font-family:Consolas,Menlo,monospace;background:#1e1e1e;color:#d4d4d4;padding:20px}
@@ -517,19 +693,33 @@ table{border-collapse:collapse}
 th,td{padding:6px 14px;border-bottom:1px solid #333;text-align:right}
 th{color:#9cdcfe}
 td:first-child,th:first-child{text-align:left}
+.on{color:#4ec9b0}.off{color:#f44747}
 .total{margin-top:12px;color:#ce9178}
 .meta{margin-top:8px;color:#666;font-size:12px}
 </style></head><body>
-<h3>proxyNet 流量统计 <small style="color:#666">%s</small></h3>
-<table><tr><th>服务器</th><th>状态</th><th>流数</th><th>活跃</th><th>累计连接</th><th>上行</th><th>下行</th><th>上行速度</th><th>下行速度</th></tr>
-%s</table>
-<div class="total">总计: 活跃 %d / 累计 %d  ↑%s ↓%s（↑%s/s ↓%s/s）</div>
-<div class="meta">每 3 秒自动刷新 · %s</div>
-</body></html>`, status, rows.String(), totalActive, totalConns,
-		humanBytes(totalUp), humanBytes(totalDown),
-		humanBytes(totalUpRate), humanBytes(totalDownRate),
-		time.Now().Format("15:04:05"))
+<h3>proxyNet 流量统计 <small id="status" style="color:#666"></small></h3>
+<table><thead><tr><th>服务器</th><th>状态</th><th>流数</th><th>活跃</th><th>累计连接</th><th>上行</th><th>下行</th><th>上行速度</th><th>下行速度</th><th>服务端健康</th></tr></thead>
+<tbody id="rows"></tbody></table>
+<div class="total" id="total"></div>
+<div class="meta">每 3 秒局部刷新（不重载页面）· 更新于 <span id="ts"></span></div>
+<script>
+async function refresh(){
+  try{
+    const d = await (await fetch('/api/stats')).json();
+    document.getElementById('status').textContent = d.status;
+    document.getElementById('total').textContent = '总计: ' + d.total;
+    document.getElementById('ts').textContent = d.updatedAt;
+    document.getElementById('rows').innerHTML = d.servers.map(s =>
+      '<tr><td>'+s.addr+'</td>'+
+      '<td class="'+(s.online?'on':'off')+'">'+(s.online?'在线':'离线')+'</td>'+
+      '<td>'+s.streams+'</td><td>'+s.active+'</td><td>'+s.total+'</td>'+
+      '<td>'+s.up+'</td><td>'+s.down+'</td><td>'+s.upRate+'/s</td><td>'+s.downRate+'/s</td>'+
+      '<td title="'+s.healthAt+'">'+s.health+'</td></tr>').join('');
+  }catch(e){}
 }
+setInterval(refresh, 3000); refresh();
+</script>
+</body></html>`
 
 // statsText formats pool statistics as a multi-line block with a total line.
 func (a *App) statsText() string {

@@ -89,6 +89,16 @@ func NewPool(localAddr, remoteAddr string, servers []ServerConfig, connsPer int)
 	return p, nil
 }
 
+// DialServer opens a single SSH connection to the given server. Intended for
+// one-shot admin/health-check operations.
+func DialServer(s ServerConfig) (*ssh.Client, error) {
+	cfg, err := buildSSHConfig(s)
+	if err != nil {
+		return nil, err
+	}
+	return ssh.Dial("tcp", fmt.Sprintf("%s:%d", s.Server, s.Port), cfg)
+}
+
 func buildSSHConfig(s ServerConfig) (*ssh.ClientConfig, error) {
 	var authMethods []ssh.AuthMethod
 
