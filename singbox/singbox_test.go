@@ -6,7 +6,7 @@ import (
 )
 
 func TestGenerateClientConfig(t *testing.T) {
-	cfg := GenerateClientConfig("tun0", "172.19.0.1/30", 1400, 1080, []string{"192.168.3.33"}, "127.0.0.1", []string{"vEthernet (WSL)"}, []string{"192.168.0.0/16"})
+	cfg := GenerateClientConfig("tun0", "172.19.0.1/30", 1400, 1080, []string{"192.168.3.33"}, "127.0.0.1", []string{"vEthernet (WSL)"}, []string{"192.168.0.0/16"}, "log/2026/09/30/sing-box.log")
 
 	var v map[string]interface{}
 	if err := json.Unmarshal([]byte(cfg), &v); err != nil {

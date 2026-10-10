@@ -36,8 +36,8 @@ func New(exePath, configPath string) *Manager {
 // serverAddrs are the SSH server endpoints; all of them are excluded from the
 // tunnel to avoid routing loops. dnsServer is the TCP DNS endpoint on the
 // remote side (reachable through the proxy). localSubnets are routed directly
-// instead of through the tunnel.
-func GenerateClientConfig(tunName, tunAddr string, mtu int, socksPort int, serverAddrs []string, dnsServer string, excludeInterfaces, localSubnets []string) string {
+// instead of through the tunnel. logPath is where sing-box writes its own log.
+func GenerateClientConfig(tunName, tunAddr string, mtu int, socksPort int, serverAddrs []string, dnsServer string, excludeInterfaces, localSubnets []string, logPath string) string {
 	excludeJSON, _ := json.Marshal(excludeInterfaces)
 
 	excludedAddrs := append([]string{}, localSubnets...)
@@ -48,8 +48,8 @@ func GenerateClientConfig(tunName, tunAddr string, mtu int, socksPort int, serve
 
 	return fmt.Sprintf(`{
   "log": {
-    "level": "info",
-    "output": "sing-box.log"
+    "level": "warn",
+    "output": %q
   },
   "dns": {
     "servers": [
@@ -71,7 +71,7 @@ func GenerateClientConfig(tunName, tunAddr string, mtu int, socksPort int, serve
       "mtu": %d,
       "auto_route": true,
       "strict_route": false,
-      "stack": "system",
+      "stack": "gvisor",
       "endpoint_independent_nat": true,
       "route_exclude_address": %s,
       "exclude_interface": %s
@@ -106,12 +106,12 @@ func GenerateClientConfig(tunName, tunAddr string, mtu int, socksPort int, serve
     ],
     "final": "proxy"
   }
-}`, dnsServer, tunName, tunAddr, mtu, excludeAddrJSON, excludeJSON, socksPort)
+}`, logPath, dnsServer, tunName, tunAddr, mtu, excludeAddrJSON, excludeJSON, socksPort)
 }
 
 // WriteConfig writes the generated config to disk.
-func (m *Manager) WriteConfig(tunName, tunAddr string, mtu int, socksPort int, serverAddrs []string, dnsServer string, excludeInterfaces, localSubnets []string) error {
-	cfg := GenerateClientConfig(tunName, tunAddr, mtu, socksPort, serverAddrs, dnsServer, excludeInterfaces, localSubnets)
+func (m *Manager) WriteConfig(tunName, tunAddr string, mtu int, socksPort int, serverAddrs []string, dnsServer string, excludeInterfaces, localSubnets []string, logPath string) error {
+	cfg := GenerateClientConfig(tunName, tunAddr, mtu, socksPort, serverAddrs, dnsServer, excludeInterfaces, localSubnets, logPath)
 	return os.WriteFile(m.configPath, []byte(cfg), 0644)
 }
 

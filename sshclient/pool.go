@@ -298,7 +298,9 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// pick returns a random member with an established stream, or nil.
+// pick returns a stream using the "power of two choices" rule: sample two
+// random candidates and use the one with fewer active connections. This
+// avoids hot spots with no global coordination.
 func (p *Pool) pick() (*member, *ssh.Client) {
 	var aliveM []*member
 	var aliveC []*ssh.Client
@@ -313,8 +315,16 @@ func (p *Pool) pick() (*member, *ssh.Client) {
 	if len(aliveC) == 0 {
 		return nil, nil
 	}
-	i := rand.Intn(len(aliveC))
-	return aliveM[i], aliveC[i]
+	if len(aliveC) == 1 {
+		return aliveM[0], aliveC[0]
+	}
+
+	a := rand.Intn(len(aliveC))
+	b := rand.Intn(len(aliveC))
+	if atomic.LoadInt64(&aliveM[a].activeConns) <= atomic.LoadInt64(&aliveM[b].activeConns) {
+		return aliveM[a], aliveC[a]
+	}
+	return aliveM[b], aliveC[b]
 }
 
 // MemberStats is a per-server traffic snapshot.

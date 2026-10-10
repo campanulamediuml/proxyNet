@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -27,6 +28,7 @@ type App struct {
 	sb          *singbox.Manager
 	dnsManager  *route.DNSManager
 	systray     *tray.Tray
+	logDir      string
 	mu          sync.Mutex
 	connected   bool
 	dnsApplied  bool
@@ -139,6 +141,7 @@ func main() {
 		cfg:        cfg,
 		sb:         singbox.New(sbExe, filepath.Join(exeDir, "sing-box-client.json")),
 		dnsManager: route.NewDNSManager(filepath.Join(exeDir, "dns_backup.json")),
+		logDir:     filepath.Join(exeDir, "log"),
 	}
 
 	app.systray = tray.New(
@@ -155,15 +158,17 @@ func main() {
 	log.Println("Tray UI stopped")
 }
 
-func initLogger(exeDir string) (*os.File, error) {
-	logPath := filepath.Join(exeDir, "proxyNet.log")
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
+// initLogger routes log output to log/YYYY/MM/DD/proxyNet.log (rotated
+// daily, kept for logKeepDays days) and stdout.
+func initLogger(exeDir string) (*dailyLogWriter, error) {
+	w := newDailyLogWriter(filepath.Join(exeDir, "log"), "proxyNet.log")
+	// Force the first open now so a failure surfaces at startup.
+	if _, err := w.Write(nil); err != nil {
 		return nil, err
 	}
-	log.SetOutput(io.MultiWriter(f, os.Stdout))
+	log.SetOutput(io.MultiWriter(w, os.Stdout))
 	log.SetFlags(log.LstdFlags)
-	return f, nil
+	return w, nil
 }
 
 func (a *App) connect() {
@@ -280,6 +285,7 @@ func (a *App) startTunnel() error {
 		a.cfg.DNSServer,
 		a.cfg.ExcludeInterfaces,
 		a.cfg.LocalSubnets,
+		dailyLogPath(a.logDir, "sing-box.log"),
 	); err != nil {
 		a.pool.Stop()
 		a.pool = nil
@@ -531,9 +537,30 @@ func probeServer(s ServerEntry) serverHealth {
 	}
 	defer session.Close()
 
-	out, err := session.Output(serverProbeScript)
-	if err != nil {
-		h.Err = err.Error()
+	// The SSH dial has a timeout, but a half-open connection can still block
+	// session.Output forever. Run it in a goroutine and force-unblock by
+	// closing the client on timeout, so the probe loop never hangs.
+	type outputResult struct {
+		out []byte
+		err error
+	}
+	done := make(chan outputResult, 1)
+	go func() {
+		out, err := session.Output(serverProbeScript)
+		done <- outputResult{out, err}
+	}()
+
+	var out []byte
+	select {
+	case r := <-done:
+		if r.err != nil {
+			h.Err = r.err.Error()
+			return h
+		}
+		out = r.out
+	case <-time.After(15 * time.Second):
+		client.Close()
+		h.Err = "probe timed out"
 		return h
 	}
 
@@ -795,6 +822,11 @@ func writeExampleConfig(dir string) {
 
 // tunInterfaceExists reports whether a network adapter with the given name exists.
 func tunInterfaceExists(name string) bool {
+	// Fast path: the TUN adapter is a real interface, no need to spawn
+	// PowerShell for every poll while waiting for it to come up.
+	if _, err := net.InterfaceByName(name); err == nil {
+		return true
+	}
 	escaped := strings.ReplaceAll(name, "'", "''")
 	ps := fmt.Sprintf(
 		"Get-NetAdapter -Name '%s' -ErrorAction SilentlyContinue | Select-Object -First 1 | ConvertTo-Json",
